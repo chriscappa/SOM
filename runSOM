@@ -1,0 +1,1268 @@
+#pragma rtGlobals=1		// Use modern global access method and strict wave access.
+
+//******************************************************************************************
+// The Statistical Oxidation Model
+// Actually started keeping notes on updates on 07/07/2013
+// 10/16/2013: 1. Saved as v6 (from v5)
+//10/13/2013: Added capability of turning off equilibrium partitioning to particles so that only gas-phase chemistry and gas wall-loss can be considered
+// 08/20/2013: 1. fixed gas-phase wall-loss...it was in the wrong spot and didn't actually do anything. Values around 1e-6/s affect the results. 
+//			  2. Added particle wall loss option, based on wall-losses in Loza et al. Atmos. Chem. Phys., 12, 151–167, 2012
+// 07/20/2013: Added option to perform eqm. calculations based on mass concentrations, as opposed to molecular concentrations
+//			it is not clear which is "better" to use, but some (e.g. Donahue) prefer mass, with the argument that it better captures the actual physicallity of the situation, which is that bigger molecules take up more space.
+//			search for string "units" to update and select which method to use
+// 07/11/2013: MAJOR update
+//			1. it was determined that there was an error in how the fragmentation was being applied. this has now been corrected so that
+//			fragmentation probabilities depend on the oxygen content of the PARENT species. Oops. Corrected both in SOM_v1 and in SOM_Heterogeneous
+//			2. added multithreading to SOM_v1 and heterogeneous that cut off serious time. Hooray.
+// 07/07/2013: added an option to account for wall-losses of gas-phase species
+//			assumes a first order loss, with gasWLR in units of per second.
+
+FUNCTION SOM_v7_3_1([SOMparams,InitialConcMatrix,fitcoefs,fittime,quiet])
+	wave SOMparams// 2D wave; rows = parameters for a given compound; columns = different compounds
+					// [0] = Ncarbons for each species
+					// [1] = FragSlope
+				 	// [2] = delta_logCstar_perO
+				 	// [3] = Pfunc[0]
+				 	// [4] = Pfunc[1]
+				 	// [5] = Pfunc[2]
+				 	// [6] = Pfunc[3]
+				 	// [7] = krxn (leave 0 if default should be used)
+	wave InitialConcMatrix // 2D wave; each column contains concentrations for a given VOC precursor class (in ppm)
+						// each row contains the conc. for a given Nc species, starting from the top
+				 	
+	wave fitcoefs		// [0] = FragSlope
+				 	// [1] = delta_logCstar_perO
+				 	// [2] = Pfunc[0]
+				 	// [3] = Pfunc[1]
+				 	// [4] = Pfunc[2]
+				 	// [5] = Pfunc[3]
+				 	// [6] = GasWLR	// gas-phase wall loss rate
+	wave fittime		// time wave to use, if fitting data
+	variable quiet		// 0 (default) = print, 1 = limited printing
+	
+	// everything should happen in root folder...yes, this is annoying but more trouble to rewrite everything
+	setdatafolder root:
+	
+// Deal with number of precursor VOCs (more than one is a fundamental shift...need to check calculations carefully)
+	variable nVOCs // # of precursor VOCs
+	if(ParamIsDefault(SOMparams))
+		nVOCs = 1 // 1 is the default
+	else
+		nVOCs = dimsize(SOMparams,1) // # of columns = # of precursor VOCs
+	endif
+	string cdf // current data folder
+	string df_home = "root:"
+	setdatafolder $df_home
+	cdf = getdatafolder(1)
+	string df_base = "root:VOCs" // Folder in which waves for individual VOCs are stored (in subfolders)
+	string df_VOC // TBD; subfolders for storing individual waves from individual VOCs
+	variable idex_VOCs // index for looping around different VOCs
+	make/o/d/n=(nVOCs)/FREE nCforVOCs
+	nCforVOCs = SOMparams[0][p]
+	wavestats/q nCforVOCs
+	variable nCmax = V_max // maximum number of VOCs...all waves will be based on this, but populated according to actual nC for each compound
+
+	if(ParamIsDefault(quiet))
+		quiet = 0		
+	endif
+
+//***//***// This bit is if 1 compound only //**//**//**
+	// specify SOM parameters
+	NVAR FragSlope // either mfrag or cfrag, depending on fragmentation method
+	NVAR delta_logCstar_perO // change in logCstar per oxygen added
+	NVAR ProbOx1, ProbOx2, ProbOx3, ProbOx4	// probability of adding some number of oxygen atoms
+	NVAR gasWLR			// gas phase wall loss first order rate coefficient (1/s)
+	variable numFitCoefs = numpnts(FitCoefs)	// number of elements in FitCoefs; needed to deal with more than standard 6 FitCoefs
+	if(ParamIsDefault(fitcoefs))
+		// use values from panel
+		if(ProbOx1<0)
+			  ProbOx1 = 1e-4 
+		endif
+		if(ProbOx2<0)
+		 	 ProbOx2 = 1e-4 
+		endif
+		 if(ProbOx3<0)
+		 	 ProbOx3 = 1e-4 
+		 endif
+		 if(ProbOx4<0)
+		 	 ProbOx4 = 1e-4 
+		 endif
+	else
+		// set values from FitCoefs
+		FragSlope = fitcoefs[0]
+		delta_logCstar_perO = fitcoefs[1]
+		ProbOx1 = fitcoefs[2]
+		 if(ProbOx1<0)
+			  ProbOx1 = 1e-4 
+	  	 endif
+		ProbOx2 = fitcoefs[3]
+		 if(ProbOx2<0)
+		 	 ProbOx2 = 1e-4 
+		 endif
+		ProbOx3 = fitcoefs[4]
+		 if(ProbOx3<0)
+		 	 ProbOx3 = 1e-4 
+		 endif
+		ProbOx4 = fitcoefs[5]
+		 if(ProbOx4<0)
+		 	 ProbOx4 = 1e-4 
+		 endif
+		 if(numFitCoefs > 6)
+		 	gasWLR = fitCoefs[6]
+		 endif
+	endif
+	// make a matrix to hold oxygen addition probabilities for later use
+	// normalize so that total probability sums to 1
+	variable ProbOxSum = ProbOx1 + ProbOx2 + ProbOx3 + ProbOx4
+	ProbOx1 /= ProbOxSum
+	ProbOx2 /= ProbOxSum
+	ProbOx3 /= ProbOxSum
+	ProbOx4 /= ProbOxSum
+//***//***// Above bit is if 1 compound only //**//**//**
+	
+	// For multiple VOCs
+		variable mfrag
+		variable DLVP
+		variable POx1
+		variable POx2
+		variable POx3
+		variable POx4
+		ProbOxSum = POx1 + POx2 + POx3 + POx4
+		POx1 /= ProbOxSum
+		POx2 /= ProbOxSum
+		POx3 /= ProbOxSum
+		POx4 /= ProbOxSum
+	
+	// Specify time step
+	NVAR nsteps // number of time steps --> this is not an input, but will be calculated later
+	NVAR timestep // timestep in seconds --> this is an input, may be adjusted below
+	if(gasWLR > 0)	// deal with issues of numerical stability
+		if(timestep > 0.05/gasWLR)
+			timestep = 0.05/gasWLR
+		endif
+	endif
+	NVAR MaxTime_hours // length of simulation, in hours --> this is an output
+	nsteps = ceil(MaxTime_hours*60*60/timestep)+1	// total number of time steps
+	
+	// Select whether to interpolate the results to an experimental time base
+	// This is important when data fitting
+	variable InterpToExperiment
+	if(ParamIsDefault(fittime))
+		InterpToExperiment = 0	// do nothing
+	else
+		InterpToExperiment = 1	// do something
+	endif
+
+	// Set this variable to control number of iterations during fitting
+	// This doesn't always seem to do anything...
+	variable V_FitMaxIters = 10 // max number of iterations
+	
+	if(quiet==0)
+		print "//"
+		print "Model Run at " + time() + " on " + date()
+	endif
+	
+// Access variables from panel, and create a few more variables for use
+// Oligomerization
+	NVAR OligomerizationIsOn// oligomerization is on (1) or off (0)
+	NVAR krxn_base_olig		// oligomerization bimolecular rate coefficient
+// Gas-phase wall loss
+	variable gasWLmethod = 1 // 0 = irreversible uptake, 1 = reversible uptake
+	NVAR Cwall				// "effective" wall concentration; 10 mg/m3 is default choice
+	NVAR kwall_gas_scaling	// composition dependent wall loss rate coefficient; not really used 
+	NVAR noSOA			// Set this to 1 if just the gas-phase chemistry is to be run w/o SOA formation
+
+	NVAR Ncarbons // number of carbon atoms in parent molecule --> input for 1 precursor
+	variable Noxygens_parent = 0	// adjust this to change the number of oxygens on the parent molecule
+	variable Nox_precursor = 0 // number of oxygens in precursor species...oops, created this twice. Same as Noxygens_parent
+	variable nC
+	variable nO 
+	nC = nCarbons
+//	nO = ceil(20/(nC^0.33)) //+ 2 // Max number of oxygen atoms that can be added
+	nO = 8 // 8 seems to provide robust results. Seven also works reasonably well, but can limit O:C
+	variable Nspecies = nCmax*nO		// added 08/26/14 for dynamic partitioning; updated to nCmax (from nC) on 10/24/2015
+
+	if(OligomerizationIsOn==1) // Oligomerization is not ready for primetime yet (note from 10/24/15)
+		nC = nC*2
+		nO = nO*2 // max number of oxygen atoms that can be added
+	endif
+	
+	// concentrations
+	NVAR ctot_ppm // concentration of parent hydrocarbon (gas + particle) in ppm
+	variable Ctot_init // initial mass loading (in ug/m^3) of the total organic (gas + particle) material
+	// info about particles
+	NVAR Nparticles // #/cm^3 --> input
+	variable Np = Nparticles*1e6 // #/cm^3 --> #/m^3
+	NVAR Density_Base // g/cm^3 --> input
+	variable density = density_base*1000 // g/cm^3 --> kg/m^3
+	// parameters related to kinetics
+	NVAR krxn_parent // cm3/molecules.s; set to zero to use default values
+	NVAR krxn_method // 4 is the method of choice, now (10/24/15), so hardwired below
+	krxn_method = 4
+	NVAR O3_yn // 0 = OH reactions, 1 = O3 reaction (no secondary chemistry)
+	NVAR O3_conc // O3 concentration, if O3_yn = 1
+	NVAR usescalingforoxidant // 0 = constant; 1 = exponential decay; 2 = interpolate observed [OH] or [O3] to model timebase (requires experimental data)
+	// Parameters for Van Krevelen
+	NVAR H_per_O // user selectable; has minimal influence on anything except H:C ratio
+	NVAR Hadjustment // user selectable; meant to account for difference between MW calculation for hydrocarbon (H = 2C+2) and actual VOC
+						// however, we now just set this to 0 all the time, as it doesn't really matter (i.e. gets accounted for in fit parameters and makes life simple)
+	// some constants
+	variable m, n, o, k, i, j
+	variable Na = 6.022e23	 // molecules/mol...Avagadros Number
+	NVAR Temp_G 			// temperature, in Kelvin, as global variable
+	NVAR Pressure_G 		// pressure, in atm, as global variable
+	variable Tvar = Temp_G	// Kelvin
+	variable Pressure = Pressure_G * 760 * 133.322 // Pa
+	variable NumberDensityAir = Pressure / (1.381e-23 * Tvar) // molecules per m^3
+	NVAR EqmMethod
+	string units
+	if(EqmMethod == 0) // "molecules" or "mass"; affects how eqm. partitioning is performed. See EqmCalc().
+		units = "molecules"	
+	else
+		units = "mass"
+	endif
+
+// 2. Specify various properties.
+
+  	variable Diff_CO2 = 0.138e-4 // m^2/s, diffusion coefficient for CO2 (will scale other values from this)
+  	variable MW_CO2 = 44	// g/mol, MW of CO2
+
+	// Parameters for size distribution; added 10/16/13; updated 092914
+	NVAR SizeSpread		// log-normal standard deviation for seed particle distribution; added 10/16/13
+	NVAR SeedDiameter		// seed particle diameter in nm; added 10/16/13 as an alternative to the seed concentration
+  	NVAR SeedVolConc		// um^3/cm^3, will be calculated
+	NVAR SeedSurfaceArea	// to be calculated
+	NVAR polydisperse		// 0 = monodisperse, 1 = polydisperse
+	NVAR nSizeBinsG		// Global variable (not on panel); set to 7; so nSizeBins just hardwired in next line
+	variable nSizeBins = 7// nSizeBinsG 
+	variable index_size
+	variable dlogDp			// dlogDp associated with generated size distribution
+	variable DpStart = SeedDiameter	// initial median particle diameter
+  	variable VolumeSeed = (pi/6)*((DpStart*1e-9)^3)	// m^3/particle, seed volume per particle
+  	variable VolumeOrgPerParticle		// volume of organic per particle, to be calculated
+	
+	if(polydisperse==0)
+		nSizeBins = 1	// monodisperse
+	endif
+	
+	dlogDp = makelognormaldistn(SizeSpread,SeedDiameter,Nparticles,nbins = nsizebins) // (log(Dp2)-log(Dp1)) = constant
+	wave Diameter	// nm, by size
+	wave dNdlogDp	// p/cm^3, conc, by size
+	wave dSdlogDp	// m2/m3 (I think)
+	wave dVdlogDp	// um3/m3 (I think)
+	variable NpCalc	// particle number concentration
+	make/o/d/n=(nsizebins)/FREE logDp	// log(Dp)
+	logDp = log(diameter)
+	Integrate/METH=1 dNdlogDp/X=logDp/D=INT_Result
+	NpCalc = INT_Result[nsizebins-1]	// integrated number concentration, p/cm3
+	Integrate/METH=1 dVdlogDp/X=logDp/D=INT_Result
+	SeedVolConc = INT_Result[nsizebins-1]/1e9 // um^3/cm^3
+	Integrate/METH=1 dSdlogDp/X=logDp/D=INT_Result
+	SeedSurfaceArea = INT_Result[nsizebins-1]/1e6 // um^2/cm^3
+  	make/o/d/n=(nSizeBins) VolumeSeedPerBin = (pi/6)*((Diameter[p]*1e-9)^3)	// m^3/particle
+	variable SeedMW = 250 // g/mol; DOS = 427
+  	make/o/d/n=(nSizeBins) MoleculesSeedPerBin = VolumeSeedPerBin * 1e6 * 1 * (1/SeedMW) * Na * (dlogDp*dNdlogDp) // m^3/p * cm3/m3 * g/cm3 * mol/g * molecules/mol * p/cm^3
+  	make/o/d/n=(nSizeBins) VolumeOrgPerBin // m^3/particle
+  	make/o/d/n=(nSizeBins) dDpdt_on, dDpdt_off
+  	
+  	if(Polydisperse==0) // monodisperse
+  		SeedVolConc = VolumeSeed*NParticles*1e18	// um^3/cm^3
+		SeedSurfaceArea = (4*pi*(DpStart*1e-3/2)^2)*(Nparticles) // um^2/cm^3
+	endif
+
+	// Parameters for Particle Wall Loss; Added 08/20/13
+	// empirical expression determined from Loza et al., ACP, 2012
+	NVAR ParticleWallLoss	// 0 = no loss, 1 = loss
+	variable particleWLR	// size-dependent wall loss rate in per second; calculated at each model time-step below
+	make/o/d/n=(numpnts(dndlogdp)) particleWLR_wave
+	note particleWLR_wave "units = 1/s; determined from Loza et al, 2012 for Caltech chamber"
+	
+	 // Parameters for dynamic partitioning, added 11/12/13
+  	NVAR KineticMassTransfer 	// 0 = equilibrium calculation; 1 = dynamic partitioning
+	NVAR alpha 					// accommodation coefficient, timestep will scale with this
+	 // Method for dynamic partitioning
+	variable DynPartODE = 0 // set to 0 to use Euler-like method (preferred) 	
+	variable MassTransferMaxTime = 0.3	// seconds, for operator split, added 11/12/13
+  		// specify time step for dynamic partitioning based on alpha
+  		// Usual timestep is 60 seconds, so useful to keep as divisors of 60
+  	if(alpha < 1e-4)
+  		MassTransferMaxTime = 30
+  	elseif(alpha < 0.5e-3)
+  		MassTransferMaxTime = 30
+  	elseif(alpha <= 1e-2)
+  		MassTransferMaxTime = 10
+  	elseif(alpha <= 1e-1)
+  		MassTransferMaxTime = 10//1
+  	elseif(alpha <= 1)
+  		MassTransferMaxTime = 0.3
+  	endif
+   	variable MassTransferTimeScaling = round(TimeStep/MassTransferMaxTime)	// number of timesteps in operator split, added 11/12/13
+
+	// absorbing seed
+	NVAR AbsorbingSeed		// 0 = no, 1 = yes
+	variable SeedMass = 0.0000000005 // ug/m^3
+	if(AbsorbingSeed == 0)
+		SeedMass = 1e-6		// ug/m^3
+	else
+		SeedMass = SeedVolConc * 1.0	// ug/m^3, and where 1.0 is the assumed density
+	endif
+	variable SeedMolecules = SeedMass * 1e-6 * 1e-6 * Na / SeedMW // molecules/cm^3
+	NVAR DilutionVar //variable DilutionVar = 0//6.12 // % per hour (6.12% from Dzepina et al., 2011)
+	NVAR logCstar_adjustmentfactor //variable logCstar_adjustmentfactor = 0.9 // multiplicative factor to adjust logCstar values. Important for isomer simulations
+
+// Decide how to represent volatility...legacy and not currently in use (5/27/13)	
+	string Cstar_evolution = "no" // yes to allow for time varying functional group evolution
+	variable delta_logCstar_perO_final = 2.2 // relative to delta_logCstar_perO
+	variable delta_logCstar_perO_perStep = (delta_logCstar_perO_final-delta_logCstar_perO)/nsteps
+// Decide how to implement fragmentation	
+	NVAR Pfrag_type // 0 = cfrag*Nox; 1 = (O:C)^mfrag
+	NVAR Frag_Method = small_fragments // 0 for random number generator, 1 for equal probs., 2 to only produce fragments with 1 carbon (HCHO, CO2, CH4)
+  // some other silly things
+	variable steady_state = 0, SSvalue = 0 // 0 for base case, any number for something else keep parent gas-phase abundance at initial abundance
+// OH concentration...many of these are not in use (5/27/13)
+	NVAR OHconc // [OH] in molecules/cm^3
+	NVAR OH_scale // scaling factor to have [OH] decrease exponentially with time; OHconc_t = OHconc_0*exp(-timewv[idex-1]*oh_scale)
+	variable OH_profile = 2 // 1 to have a diurnal profile of OH concentrations; 2 for anything else
+	variable OH_counter = 0 // related to diurnal profile
+	variable day_counter = 0 // related to diurnal profile
+	variable day_iseven = 1 // related to diurnal profile
+	variable OH_max = 4e6 // related to diurnal profile
+	variable OH_min = 1e5 // related to diurnal profile
+// Parameters for heterogeneous chemistry
+	variable OH_Flux = (OHconc*1e6)*1.381e-23*Tvar/sqrt(2*pi* (17/1000/6.022e23)*1.381e-23*Tvar) // molecules m^-2 s^-1, will be calculated on the fly
+	variable OH_Rate // molecules/s; will be calculated from OH_Flux and particle surface area
+	NVAR gammaOH // OH reactive uptake coefficient
+	NVAR hetchem // 0 for no heterogeneous chemistry; 1 to include
+
+// Parameters for sequential partitioning model (SPM)
+	NVAR SPM // 0 to ignore, 1 to include
+// Parameters for timing
+	variable t11, t22
+
+			
+//3. Write a bit of info to a wave
+	string RunInfoStr = ""
+	make/O/T RunInfo = ""
+	make/o/d RunValues
+
+	RunInfoStr = "nC;Ctot_init_ug_m3;Ctot_ppm;OHconc_molec_cm3;OH_scale;FragSlope;delta_logCstar_perO;ProbOx1;ProbOx2;ProbOx3;ProbOx4;"
+	RunInfoStr += "PfragMethod;SeedMass;SeedMW;AbsorbingSeed;RunTime;nsteps;timestep;DilutionVar;Small_Fragments;H_per_O;Hadjustment;hetchem;gammaOH;SPM;"
+	RunInfoStr += "krxn_parent;O3_yn;O3_conc_ppb;logCstar_adjustmentfactor;kwall_gas;kwall_aer;Oligomerization;krxn_base_olig;EqmMethod"
+	i= ItemsInList(RunInfoStr)
+	Make/O/T/N=(i) RunInfo= StringFromList(p,RunInfoStr)
+	RunValues = {nC,Ctot_init,Ctot_ppm,OHconc,OH_scale,FragSlope,delta_logCstar_perO,ProbOx1,ProbOx2,ProbOx3,ProbOx4}
+	wavestats/Q RunValues
+	RunValues[x+V_npnts] = {Pfrag_type,seedmass,seedMW,AbsorbingSeed,MaxTime_Hours,nsteps,timestep,DilutionVar,Frag_Method,H_per_O,Hadjustment,hetchem,gammaOH,SPM}
+	wavestats/Q RunValues
+	RunValues[x+V_npnts] = {krxn_parent,O3_yn,O3_conc,logCstar_adjustmentfactor,gasWLR,ParticleWallLoss,OligomerizationIsOn,krxn_base_olig,EqmMethod}
+
+// 4. Create a bunch of waves (multi-dimensional) for use in calculations	
+	
+	MakeSOMwaves(SOMparams,nSteps,nSizeBins,nCmax,nO,timestep) // creates a bunch of VOC-specific waves in folders
+	// now make general waves (non-VOC specific)
+	setdatafolder root: // create in root
+	
+	make/d/o/n=(nsteps) SeedConc_time = SeedVolConc
+	setscale/P x, 0, (timestep/60/60), "hours", SeedConc_time
+	//
+	make/d/o/n=(nsteps) TimeW = 0
+	note TimeW "Reaction time [hrs]"
+	//
+	make/d/o/n=(nsteps) O2C_time = nan
+	note O2C_time "Oxygen-to-Carbon ratio of total SOA"
+	setscale/P x, 0, (timestep/60/60), "hours", O2C_time
+	setscale/P d, 0, 0, "O:C", O2C_time
+	make/d/o/n=(nsteps) H2C_time = nan
+	note H2C_time "hydrogen-to-carbon ratio of total SOA"
+	setscale/P x, 0, (timestep/60/60), "hours", H2C_time
+	setscale/P d, 0, 0, "H:C", H2C_time
+	make/d/o/n=(nsteps) OCseed_time = 0
+	//
+	make/d/o/n=(nsteps) Coa_time = 0
+	note Coa_time "Total SOA mass concentration [ug/m^3]"
+	note Coa_time "nVOCs used = " + num2str(nVOCs) 
+	note Coa_time "Pfrag = using type " + num2str(Pfrag_type) + " and method " + num2str(Frag_Method)
+	setscale/P x, 0, (timestep/60/60), "hours", Coa_time
+	setscale/P d, 0, 0, "ug/m\S3\M", Coa_time
+	//
+	make/d/o/n=(nsteps) Coa_time_wallcorr = 0
+	note Coa_time_wallcorr "Particle wall-loss corrected total SOA mass concentration [ug/m^3]"
+	note Coa_time_wallcorr "Coa_time_wallcorr = Coa_time + WallParticleMolec_Matrix"
+	setscale/P x, 0, (timestep/60/60), "hours", Coa_time_wallcorr
+	setscale/P d, 0, 0, "ug/m\S3\M", Coa_time_wallcorr
+	//
+	make/d/o/n=(nsteps) deltaHC_time = 0
+	setscale/P x, 0, (timestep/60/60), "hours" deltaHC_time
+	make/d/o/n=(nsteps) HC_ppb_time = 0
+	note HC_ppb_time "Total Parent HC concentration [ppb]"
+	setscale/P x, 0, (timestep/60/60), "hours" HC_ppb_time
+	setscale/P d, 0, 0, "ppb" HC_ppb_time
+	make/d/o/n=(nsteps) deltaHCfrac_time = 0
+	setscale/P x, 0, (timestep/60/60), "hours", deltaHCfrac_time
+	make/d/o/n=(nsteps) Yield_time = 0
+	note Yield_time "Total aerosol mass yield"
+	setscale/P x, 0, (timestep/60/60), "hours", Yield_time
+	//
+	make/d/o/n=(nsteps) OH_wave = OHconc
+	note OH_wave "[OH] in molecules/cm^3"
+	setscale/P x, 0, (timestep/60/60), "hours", OH_wave
+	setscale/P d, 0, 0, "molecules/cm\S3\M", OH_wave
+	make/d/o/n=(nsteps) OH_exposure = 0
+	make/d/o/n=(nsteps) Lifetimes = 0
+	note Lifetimes "Number of oxidation lifetimes"
+	setscale/P x, 0, (timestep/60/60), "hours", Lifetimes
+	//
+	make/o/d/n=(nsteps) Dp_time = 0; 
+	Dp_time = DpStart // particle diameter in nm
+	note Dp_time, "Particle diameter, including seed [nm]"
+	setscale/P x, 0, (timestep/60/60), "hours", Dp_time
+	setscale/P d, 0, 0, "nm", Dp_time
+	//
+	make/o/d/n=(nsteps) Np_time = Np/1e6	// particle number concentration
+	note Np_time, "Particle Number Concentration [p/cc]"
+	setscale/P x, 0, (timestep/60/60), "hours", Np_Time
+	//
+	make/o/d/n=(nsteps,nSizeBins) dNdlogDp_time=0	// updated 9/29/14; added 10/16/13
+	dNdlogDp_time[][] = dNdlogDp[q]
+	setscale/P x, 0, (timestep/60/60), "hours", dNdlogDp_time
+	note dNdlogDp_time "dNdlogDp, concentration is p/m^3"
+	make/o/d/n=(nsteps,nSizeBins) dVdlogDp_time=0
+	setscale/P x, 0, (timestep/60/60), "hours", dVdlogDp_time
+	//
+	make/o/d/n=(nsteps,nSizeBins) NpPerBin_time=0	// added 9/29/14
+	NpPerBin_time[][] = dNdlogDp[q]*dlogDp
+	setscale/P x, 0, (timestep/60/60), "hours", NpPerBin_time
+	note NpPerBin_time "concentration per bin is p/m^3"
+	//
+	make/o/d/n=(nsteps,nSizeBins) Diameter_time=0	// updated 9/29/14; added 10/16/13
+	Diameter_time[][] = Diameter[q]
+	setscale/P x, 0, (timestep/60/60), "hours", Diameter_time
+	note Diameter_time "Changing Diameter associated with size distribution, in nm"	
+	
+	// TOTAL molecules in particle phase (sum over all VOCs)
+	make/d/o/n=(nCmax,nO) ParticleMolecules_Matrix = 0 // molecules/cm^3
+	setscale/P x, nCmax, -1, "nCarbons" ParticleMolecules_Matrix
+	setscale/P y, 0, 1, "nOxygens" ParticleMolecules_Matrix
+	note ParticleMolecules_Matrix "particle phase species concentration in molecules/cm^3"
+	note ParticleMolecules_Matrix "Ncarbons = Rows; Noxygens = columns"
+	wave ParticleMoleculesSum_Matrix = ParticleMolecules_Matrix
+	// TOTAL mass in particle phase (sum over all VOCs)
+	make/d/o/n=(nCmax,nO) ParticleMass_Matrix = 0
+	setscale/P x, nCmax, -1, "nCarbons" ParticleMass_Matrix
+	setscale/P y, 0, 1, "nOxygens" ParticleMass_Matrix
+	wave ParticleMassSum_matrix = ParticleMass_Matrix
+	// particle molecules
+	make/d/o/n=(nCmax,nO,nsteps) ParticleMolecules_Time = 0
+	note ParticleMolecules_Time "particle-phase species concentration in molecules/cm^3"
+	note ParticleMolecules_Time "Ncarbons = Rows; Noxygens = columns; Layers = time [hrs]"
+	setscale/P z, 0, (timestep/60/60), "hours", ParticleMolecules_Time
+	setscale/P x, nCmax, -1, "nCarbons" ParticleMolecules_Time
+	setscale/P y, 0, 1, "nOxygens" ParticleMolecules_Time
+	wave ParticleMoleculesSum_Time = ParticleMolecules_Time
+	// particle mass
+	make/d/o/n=(nCmax,nO,nsteps) ParticleMass_Time = 0
+	note ParticleMass_Time "particle-phase species concentration in molecules/cm^3"
+	note ParticleMass_Time "Ncarbons = Rows; Noxygens = columns; Layers = time [hrs]"
+	setscale/P z, 0, (timestep/60/60), "hours", ParticleMass_Time
+	setscale/P x, nCmax, -1, "nCarbons" ParticleMass_Time
+	setscale/P y, 0, 1, "nOxygens" ParticleMass_Time
+	wave ParticleMassSum_time = ParticleMass_time
+	//
+	make/o/d/n=(nCmax,nO,nSizeBins) PM3D_matrix = 0 // 3D version of ParticleMolecules_matrix
+	setscale/P x, nCmax, -1, "nCarbons" PM3D_matrix
+	setscale/P y, 0, 1, "nOxygens" PM3D_matrix
+	wave PM3Dsum_matrix = PM3D_matrix
+	//
+	make/o/d/n=(nCmax,nO,nSizeBins) PMM3D_matrix = 0 // 3D version of ParticleMass_matrix
+	setscale/P x, nCmax, -1, "nCarbons" PMM3D_matrix
+	setscale/P y, 0, 1, "nOxygens" PMM3D_matrix
+	wave PMM3Dsum_matrix = PMM3D_matrix
+	//
+	make/o/d/n=(nCmax,nO,nSizeBins) PMF3D_matrix = 0 // 3D version of ParticleMoleFraction_matrix
+	setscale/P x, nCmax, -1, "nCarbons" PMF3D_matrix
+	setscale/P y, 0, 1, "nOxygens" PMF3D_matrix
+	wave PMF3Dsum_matrix = PMF3D_matrix
+	// SOA associated with this VOC
+	make/d/o/n=(nsteps) Coa_time = 0
+	note Coa_time "SOA mass concentration [ug/m^3]"
+	setscale/P x, 0, (timestep/60/60), "hours", Coa_time
+	setscale/P d, 0, 0, "ug/m\S3\M", Coa_time
+	wave CoaSum_Time = Coa_time
+	// wall corrected value
+	make/d/o/n=(nsteps) Coa_time_wallcorr = 0
+	note Coa_time_wallcorr "Particle wall-loss corrected SOA mass concentration [ug/m^3]"
+	note Coa_time_wallcorr "Coa_time_wallcorr = Coa_time + WallParticleMolec_Matrix"
+	setscale/P x, 0, (timestep/60/60), "hours", Coa_time_wallcorr
+	setscale/P d, 0, 0, "ug/m\S3\M", Coa_time_wallcorr
+	wave CoaSum_Time_wallcorr = Coa_time_wallcorr
+	// Amount reacted for all compounds
+	make/d/o/n=(nsteps) deltaHC_time = 0
+	setscale/P x, 0, (timestep/60/60), "hours" deltaHC_time
+	note deltaHC_time "total amount reacted, in ug/m3"
+	setscale/P d, 0, 0, "ug/m\S3\M", deltaHC_time
+	wave deltaHCsum_time = deltaHC_time
+	make/d/o/n=(nsteps) HC_ugm3_time = 0
+	note HC_ugm3_time "Sum of parent HC concentrations [ug/m3]"
+	setscale/P x, 0, (timestep/60/60), "hours" HC_ugm3_time
+	setscale/P d, 0, 0, "ug/m\S3\M" HC_ugm3_time
+	wave HCsum_ugm3_time = HC_ugm3_time
+	// Effective yield for all compounds
+	make/d/o/n=(nsteps) Yield_time = 0
+	note Yield_time "Aerosol mass yield over all compounds"
+	setscale/P x, 0, (timestep/60/60), "hours", Yield_time
+	wave YieldSum_time = Yield_time
+	//
+	make/d/o/n=(nCmax) GasMolecules_Parent = 0
+	variable HCstart, HCfinish
+	//
+	make/o/d/n=(nCmax,nO) ParticleVolume_matrix
+	//
+	// O2C for this compound class
+	make/d/o/n=(nsteps) O2C_time = nan
+	note O2C_time "Oxygen-to-Carbon ratio of SOA"
+	setscale/P x, 0, (timestep/60/60), "hours", O2C_time
+	setscale/P d, 0, 0, "O:C", O2C_time
+	wave O2Csum_time = O2C_time
+	make/d/o/n=(nsteps) H2C_time = nan
+	note H2C_time "hydrogen-to-carbon ratio of SOA"
+	setscale/P x, 0, (timestep/60/60), "hours", H2C_time
+	setscale/P d, 0, 0, "H:C", H2C_time
+	wave H2Csum_time = H2C_time
+	make/d/o/n=(nCmax,nO) TotalCarbonAtoms = 0
+	make/d/o/n=(nCmax,nO) TotalOxygenAtoms = 0
+	make/d/o/n=(nCmax,nO) TotalHydrogenAtoms = 0
+	
+	//
+	variable Ave_nC
+	variable Ave_nO
+	variable Ave_nH
+	variable molecules_PM_previous = 0
+	
+	TimeW = (x)*timestep/60/60 // hours
+
+// Loop around for different VOCs
+	cdf = getdatafolder(1) // get current data folder
+	setdatafolder $df_home
+	for(idex_VOCs=0;idex_VOCs<nVOCs;idex_VOCs+=1)
+		df_VOC = df_base + ":VOC" + num2istr(idex_VOCs+1) // set to VOC specific data folder
+		setdatafolder $df_VOC
+
+	// 5. Populate O:C, H:C, Oxidation State and MW Matrices for each VOC
+		SOM_CreateAtomMatrices(nCmax,nO,H_per_O,Hadjustment) // changed from nC to nCmax
+
+		//$$$ Will need to access these later
+		//		wave C_matrix, O_matrix, H_matrix, OC_matrix, HC_matrix, Ox_matrix, MW_matrix
+	
+	// 5b. Populate Diffusivity and mean free path matrices; these exist in the VOC subfolders
+		wave Diffusivity_Matrix, MW_matrix, MeanFreePath_Matrix
+		Diffusivity_Matrix = Diff_CO2*(MW_CO2/MW_matrix)	// m^2/s; assume that Diffusivity scales with MW and use CO2 as reference case
+		MeanFreePath_Matrix = 3*Diffusivity_Matrix/sqrt((8*1.381e-23*Tvar)/(pi*(MW_matrix/(1000*Na))))	// meters; D/(lambda*c_bar) = 1/3, for Fuchs expression	
+	// 6. Populate initial logC* matrix
+		wave logCstar_Matrix, MW_matrix, SatConc_matrix
+		delta_logCstar_perO = SOMparams[2][idex_VOCs] // get VOC specific value
+		logCstar_Matrix[][] = -0.0337*MW_Matrix[p] + 11.56 // estimated from Lide, CRC data for saturated hydrocarbons
+		logCstar_Matrix[][] = logCstar_Matrix[p][0] - y*delta_logCstar_perO // adjust C* values based on number of oxygens per molecule
+		logCstar_matrix *= logCstar_adjustmentfactor // one can "adjust" the logCstar matrix from the base case assumptions; best to have this be 1
+		SatConc_Matrix = (10^(logCstar_Matrix)) * 1e-6 * Na / MW_Matrix // molecules/m^3; C* --> saturation concentration
+	// 6b. Enthalpy of vaporization; added 09/03/13
+		SOM_deltaHvap(logCstar_Matrix=logCstar_matrix,ConstantDHvap=0)	// ConstantDHvap = 0 means not constant, otherwise enter values in kJ/mol
+		//$$$ wave deltaHvap_matrix
+	
+	// 7. OH reaction rate coefficients
+		wave C_matrix, O_matrix // these may be be "oversized" depending on max number of carbons in the biggest VOC
+		if(OligomerizationIsOn==0)	// no oligomerization
+			SOM_RateCoefficients(C_matrix,O_matrix,0,O3_yn,TempK=Tvar,method=krxn_method)
+			wave krxn_matrix
+			// Adjust parent rate coefficient if desired
+			if(krxn_parent == 0)
+				// do nothing
+			else
+				krxn_matrix[nCmax - SOMparams[0][idex_VOCs]][0] = SOMparams[7][idex_VOCs]// // need to adjust appropriate element for oversized matrices
+			endif
+		else	// oligomerization $$$ Likely broken for multiple compounds
+			SOM_RateCoefficients(C_matrix,O_matrix,0,O3_yn,TempK=Tvar,method=krxn_method)
+			wave krxn_matrix
+//			krxn_matrix[nCarbons][Noxygens_parent] = krxn_parent
+			krxn_matrix[SOMparams[0][idex_VOCs]][0] = SOMparams[7][idex_VOCs] // set to VOC specific value
+		endif
+		setscale/P x, nC, -1, "nCarbons" krxn_matrix
+		setscale/P y, 0, 1, "nOxygens" krxn_matrix
+
+		// Uncomment to have 1st generation products only
+		variable krxn_00 = krxn_matrix[0][0]
+	//	krxn_matrix=0
+	//	krxn_matrix[0][0] = krxn_00
+	
+		if(OligomerizationIsOn==1)
+			SOM_OligomerRateCoef(nCmax*2,nO,krxn_base=krxn_base_olig) // NEED TO CHECK THIS AFTER UPDATING FOR MULTIPLE VOCS $$$
+			wave krxn_matrix_olig
+		endif
+	
+	// 8. Populate fragmentation probability matrix, which is a 3D matrix with rows = #carbons, columns = #oxygens, layers = probability
+		FragSlope = SOMparams[1][idex_VOCs] // update for each VOC
+		SOM_Fragmentation(Frag_Method,FragSlope,Pfrag_type,C_matrix,O_matrix,OC_matrix)
+		// wave Prob1_Matrix, Prob2_Matrix, Prob_Matrix, Frag1_Matrix, Frag1_Array // $$$ WILL NEED TO ACCESS LATER
+
+	// 1. Decide here how to input initial concentration	
+		// Completely updated for dealing with multiple compounds
+		// InitialConcMatrix holds the initial concentrations (in ppm)
+		wave GasMass_matrix, GasMolecules_Matrix, TotalMolecules_Matrix, MW_matrix, H_matrix
+		GasMass_matrix[nCmax-SOMparams[0][idex_VOCs],][0] = InitialConcMatrix[p-(nCmax-SOMparams[0][idex_VOCs])][idex_VOCs]
+		GasMass_matrix = GasMass_matrix*(NumberDensityAir*1e-6/Na)*(MW_matrix*1e6)
+		GasMass_Matrix = (numtype(H_Matrix) == 2 ? NaN : GasMass_Matrix) // take care of pesky NaN values
+		GasMolecules_Matrix = GasMass_Matrix * 1e-6 * 1e-6 * Na / MW_Matrix // convert ug/m^3 to molecules/cm^3
+		TotalMolecules_Matrix = GasMolecules_Matrix // (molecules/cm^3)
+		setdatafolder $df_home
+	endfor // end of VOC precursor loop
+
+	// Calculate initial Equilibrium Distribution (for multiple VOCs)
+	EqmCalc_MultipleVOC(SOMparams,SeedConc=SeedMolecules,SeedMW=SeedMW,units="molecules")
+  	
+	cdf = getdatafolder(1)
+	for(idex_VOCs=0;idex_VOCs<nVOCs;idex_VOCs+=1) // Start VOC looping
+		df_VOC = df_base + ":VOC" + num2istr(idex_VOCs+1) // set to VOC specific data folder
+		setdatafolder $df_VOC
+
+		wave GasMolecules_Matrix, ParticleMolecules_matrix, TotalMolecules_matrix
+		wave PM3D_matrix
+		wave Coa_eqm = Coa	// Does not include seed particle mass
+		GasMolecules_matrix = TotalMolecules_Matrix - Coa_eqm
+		ParticleMolecules_matrix = Coa_eqm
+		PM3D_matrix = ParticleMolecules_matrix[p][q]/nSizeBins	// divide mass among all size bins to start
+		TotalMolecules_Matrix = GasMolecules_matrix + ParticleMolecules_Matrix
+		// add to total
+		ParticleMoleculesSum_matrix += ParticleMolecules_matrix // This is necessary to allow calculation of mole fractions
+		
+		wave GasMolecules_Time, ParticleMolecules_time, TotalMolecules_time
+	// 10. Initialize Kinetics
+		GasMolecules_Time[][][0] = GasMolecules_matrix[p][q]
+		ParticleMolecules_Time[][][0] = ParticleMolecules_Matrix[p][q]
+		TotalMolecules_Time[][][0] = TotalMolecules_Matrix[p][q]
+		
+	// 10. Gas-phase wall loss initialization
+		wave logCstar_matrix, O_matrix
+		SOM_GasPhaseWallLoss(logCstar_matrix,O_matrix,gasWLR,Cw_base=Cwall,kwg_increase_perO=kwall_gas_scaling)
+		// wave kwg_off		// 2D matrix with composition dependent rate of desorption (1/s) from walls	
+		setdatafolder $df_home
+	endfor	// end loop over VOCs
+	cdf = getdatafolder(1)
+	for(idex_VOCs=0;idex_VOCs<nVOCs;idex_VOCs+=1) // start loop over VOCs
+		df_VOC = df_base + ":VOC" + num2istr(idex_VOCs+1) // set to VOC specific data folder
+		setdatafolder $df_VOC
+
+		wave ParticleMoleFraction_matrix, ParticleMolecules_matrix, PMF3D_matrix, ParticleMoleFraction_time
+		wavestats/q ParticleMoleculesSum_matrix // ths contains molecules for all species
+		ParticleMoleFraction_matrix = ParticleMolecules_Matrix/V_sum
+		PMF3D_matrix[][][] = ParticleMoleFraction_matrix[p][q]
+		ParticleMoleFraction_Time[][][0] = ParticleMoleFraction_Matrix[p][q]
+		setdatafolder $df_home
+	endfor	// end loop over VOCs
+	
+//	make/o/d/n=(nC,nO) TempWave
+	// initial particle diameter (seemingly in a random location...move somewhere better)
+   	Dp_time[0] = DpStart
+   	// some other variables...
+	variable TimeVar
+	variable FragVar
+	variable StepVar
+
+// 10b. Decide whether to utilize OH wave that has been fit to VOC decay (using linear interpolations)
+//	SetOH_from_experiment(krxn_matrix[0][0])
+	wave OH_exp	// molecules/cm^3
+	wave OH_exp_time	// hours
+	if(UseScalingForOxidant==2)
+		Interpolate2/T=1/N=200/I=3/Y=OH_exp_Interp/X=TimeW OH_exp_time, OH_exp
+		wave OH_exp_Interp
+		wavestats/q OH_exp
+		OH_exp_Interp = OH_exp_Interp < V_min ? V_min : OH_exp_Interp // do not let interpolated values be < minimum observed value
+	endif
+	// if O3...
+	if(O3_yn==1)
+		if(UseScalingForOxidant==2)
+			OH_wave = OH_exp_interp*1e-9 * (1e-6*NumberDensityAir)
+		else
+			OH_wave = O3_conc * 1e-9 * (1e-6*NumberDensityAir)
+		endif	
+	endif
+	
+	if(quiet==0)
+//		print "Ctot = " + num2str(ctot_init) + " in ug/m^3 for Nc = " + num2str(nC) + " with FragSlope = " + num2str(FragSlope) + " and dlVP = " + num2str(delta_logCstar_perO)+ " and ProbOx = " + num2str(ProbOx1) + ";"+ num2str(ProbOx2) + ";"+ num2str(ProbOx3) + ";"+ num2str(ProbOx4) + ";"
+	endif
+// End 1. Decision Finish
+// 10d. Some timing stuff		
+	t11 = ticks
+	variable FirstTime = 1
+	variable counter = 0
+
+// 11. START KINETICS
+	for(m=1;m<=nsteps-1;m+=1)
+	// 11b: Get current OH or O3 concentration (since it may not be constant)	
+		if(OH_profile == 1)
+			if(timestep*OH_counter > 43200)
+				OH_counter = 0
+				day_counter += 1
+				// check for is even
+				day_iseven = day_counter/2
+				if(day_iseven == floor(day_iseven))
+					day_iseven = 1 // 1 = true = daytime; 0 = false = nighttime
+				else
+					day_iseven = 0
+				endif
+			endif
+			
+			OHConc = (-1*(timestep*OH_counter-21600)^2 + 21600^2) / (21600^2)
+			OHConc = (OH_max*(1/((day_counter+1))) - OH_min)*OHConc + OH_min
+			OH_counter+=1
+			OH_wave[m-1] = OHconc
+			if(m>250)
+				OH_wave[m-1] = 0
+			endif
+		elseif(UseScalingForOxidant == 1)
+			OH_wave[m-1] = SOM_SetOHconc(timew,OHconc,OH_scale,m)
+		elseif(UseScalingForOxidant == 2 && O3_yn!=1)
+			OH_wave[m-1] = OH_exp_Interp[m-1]//OH_exp[m-1]
+		elseif(O3_yn!=1)	// O3!!
+			// do nothing
+		endif
+		// run differently if O3 is reactant...in this case OH_conc is actually [O3]
+		if(O3_yn==5 && UseScalingForOxidant!=2)
+			SOM_setO3conc(OH_wave,timew,Tvar,m,O3_conc)
+		elseif(O3_yn==1 && UseScalingForOxidant==2)
+			 // good to go // OH_wave[m-1] = OH_exp_interp[m-1]*1e-9 * (1e-6*NumberDensityAir)	// molecules/cm^3
+		elseif(O3_yn==1 && UseScalingForOxidant==1)
+			OH_wave[m-1] =  O3_conc * 1e-9 * (1e-6*NumberDensityAir)*(OH_scale)^(m-1)
+		endif
+
+		// 11ee: Particle loss to the walls; split for multiple compound simulations
+		if(ParticleWallLoss!=0)
+			Diameter = Diameter_time[m-1][p]
+			particleWLR_wave[] = SOM_ParticleWallLossRate(Diameter,particlewallloss)	// get size dependent wall-loss rate (1/s)
+			for(index_size=0;index_size<nSizeBins;index_size+=1)
+				particleWLR_wave[index_size] = SOM_ParticleWallLossRate(Diameter_time[m-1][index_size],particlewallloss)	// get size dependent wall-loss rate
+			endfor
+			NpPerBin_time[m][] = NpPerBin_time[m-1][q] - NpPerBin_time[m-1][q]*particleWLR_wave[q]*timestep				// loss of particles
+		endif	
+		// calculate total species concentration after (1) gas-phase reaction, (2) gas-phase wall loss and (3) particle-phase wall loss
+		TotalMolecules_Matrix = GasMolecules_matrix + ParticleMolecules_Matrix // Gas is new; Particle is from previous step, adjusted for wall losses
+
+		cdf = getdatafolder(1)
+		for(idex_VOCs=0;idex_VOCs<nVOCs;idex_VOCs+=1) // start loop over VOCs
+			df_VOC = df_base + ":VOC" + num2istr(idex_VOCs+1) // set to VOC specific data folder
+			setdatafolder $df_VOC
+			wave TotalMolecules_matrix, GasMolecules_matrix, ParticleMolecules_matrix
+			wave RxnStep_Matrix_minus, krxn_matrix
+			wave RxnStep_Matrix_plus, RxnStep_matrix_plus1, RxnStep_Matrix_plus2, RxnStep_Matrix_plus3, RxnStep_Matrix_plus4
+			wave Frag1_Matrix, RxnStep_Matrix_Frag
+			wave Prob_matrix, Prob1_matrix, Prob2_matrix
+			wave RxnStep_array_minus, Frag1_array, RxnStep_array_minus
+			wave WPM3D_matrix, PM3D_matrix, WallParticleMolec_Matrix
+			wave WallMolecules_matrix, WallMolecules_time, kwg_off
+			
+		// 11c: Run gas phase reaction to determine delta[HC]
+		// Chemical LOSS
+			if(O3_yn==0)	// reaction with OH
+				RxnStep_Matrix_minus[][] = GasMolecules_Matrix[p][q] * krxn_matrix[p][q] * timestep * OH_wave[m-1] // -d[HC] = [CnOm]*k_nm*delta_t*[OH]
+				RxnStep_Matrix_minus[][nO-1] = 0 // needed as limit on rxn...CO2 is unreactive
+				RxnStep_Matrix_minus = (numtype(RxnStep_Matrix_minus)==2 ? 0 : RxnStep_Matrix_minus) // Turn NaN's to zero's' for later math.
+				GasMolecules_matrix[][] -= RxnStep_Matrix_minus // account for LOSS due to reaction
+			elseif(O3_yn==1)	// reaction with O3; added on 08/30/13 to try and speed things up
+				RxnStep_Matrix_minus[0][] = GasMolecules_Matrix[0][q] * krxn_matrix[0][q] * timestep * OH_wave[m-1] // -d[HC] = [CnOm]*k_nm*delta_t*[OH]
+				RxnStep_Matrix_minus = (numtype(RxnStep_Matrix_minus)==2 ? 0 : RxnStep_Matrix_minus) // Turn NaN's to zero's' for later math.
+				GasMolecules_matrix[0][] -= RxnStep_Matrix_minus[0][q] // account for LOSS due to reaction
+			endif
+			// FORMATION - no fragmentation yet
+			variable FragMethTest = 1
+			mfrag = SOMparams[1][idex_VOCs]
+			POx1 = SOMparams[3][idex_VOCs]
+			POx2 = SOMparams[4][idex_VOCs]
+			POx3 = SOMparams[5][idex_VOCs]
+			POx4 = SOMparams[6][idex_VOCs]
+			ProbOxSum = POx1 + POx2 + POx3 + POx4
+			POx1 /= ProbOxSum
+			POx2 /= ProbOxSum
+			POx3 /= ProbOxSum
+			POx4 /= ProbOxSum
+			// this is the correct implementation of fragmentation. changed 07/11/13
+			if(FragSlope!=0 || O3_yn==0)	// if fragmentation is on and this is a reaction with OH
+				RxnStep_Matrix_plus1=0; RxnStep_Matrix_plus2=0; RxnStep_Matrix_plus3=0; RxnStep_Matrix_plus4=0
+				RxnStep_Matrix_plus1[][1,] = RxnStep_Matrix_minus[p][q-1]*POx1*(1-Frag1_Matrix[p][q-1])
+				RxnStep_Matrix_plus2[][2,] = RxnStep_Matrix_minus[p][q-2]*POx2*(1-Frag1_Matrix[p][q-2])
+				RxnStep_Matrix_plus2[][nO-1] += (RxnStep_Matrix_minus[p][nO-2])*POx2*(1-Frag1_Matrix[p][nO-2])
+				RxnStep_Matrix_plus3[][3,] = RxnStep_Matrix_minus[p][q-3]*POx3*(1-Frag1_Matrix[p][q-3])
+				RxnStep_Matrix_plus3[][nO-1] += (RxnStep_Matrix_minus[p][nO-2]*(1-Frag1_matrix[p][nO-2])+RxnStep_Matrix_minus[p][nO-3]*(1-Frag1_matrix[p][nO-3]))*POx3
+				RxnStep_Matrix_plus4[][4,] = RxnStep_Matrix_minus[p][q-4]*POx4*(1-Frag1_Matrix[p][q-4])
+				RxnStep_Matrix_Plus4[][nO-1] += (RxnStep_Matrix_minus[p][nO-2]*(1-Frag1_matrix[p][nO-2])+RxnStep_Matrix_minus[p][nO-3]*(1-Frag1_matrix[p][nO-3])+RxnStep_Matrix_minus[p][nO-4]*(1-Frag1_matrix[p][nO-4]))*POx4
+		 		RxnStep_Matrix_plus[][] = RxnStep_Matrix_plus1 + RxnStep_matrix_plus2 + RxnStep_Matrix_Plus3 + RxnStep_matrix_Plus4
+		 	else	// for O3 reactions, added 08/29/13
+				RxnStep_Matrix_plus = 0;RxnStep_Matrix_plus1=0; RxnStep_Matrix_plus2=0; RxnStep_Matrix_plus3=0; RxnStep_Matrix_plus4=0
+				RxnStep_Matrix_plus1[0][1,] = RxnStep_Matrix_minus[0][q-1]*POx1
+				RxnStep_Matrix_plus2[0][2,] = RxnStep_Matrix_minus[0][q-2]*POx2
+				RxnStep_Matrix_plus2[0][nO-1] += (RxnStep_Matrix_minus[0][nO-2])*POx2
+				RxnStep_Matrix_plus3[0][3,] = RxnStep_Matrix_minus[0][q-3]*POx3
+				RxnStep_Matrix_plus3[0][nO-1] += (RxnStep_Matrix_minus[0][nO-2]+RxnStep_Matrix_minus[0][nO-3])*POx3
+				RxnStep_Matrix_plus4[0][4,] = RxnStep_Matrix_minus[0][q-4]*POx4
+				RxnStep_Matrix_Plus4[0][nO-1] += (RxnStep_Matrix_minus[p][nO-2]+RxnStep_Matrix_minus[0][nO-3]+RxnStep_Matrix_minus[0][nO-4])*POx4
+		 		RxnStep_Matrix_plus[0][] = RxnStep_Matrix_plus1[0][q] + RxnStep_matrix_plus2[0][q] + RxnStep_Matrix_Plus3[0][q] + RxnStep_matrix_Plus4[0][q]
+			endif
+			// 11d: Determine what molecules are formed as a result of fragmentation
+			if(mFrag != 0) // only run this if fragmentation indeed occurs.
+				RxnStep_Matrix_Frag = 0			
+				for(i=0;i<nC;i+=1)
+					RxnStep_array_Minus[i*nO,(i+1)*nO-1] = RxnStep_Matrix_Minus[i][p-i*nO]
+				endfor
+				multithread prob_matrix = (Prob1_Matrix+Prob2_Matrix)*Frag1_Array[r]*RxnStep_Array_Minus[r]
+				MatrixOp/O RxnStep_Matrix_Frag = sumBeams(prob_matrix)
+				GasMolecules_Matrix[][] += RxnStep_Matrix_Frag + RxnStep_Matrix_Plus // New version as of 07/11/13
+			else // No fragmentation
+				GasMolecules_matrix[][] += RxnStep_Matrix_plus // molecules formed per step, accounting for different numbers of oxygens added per step
+			endif
+
+			// 11e: Wall loss of gas-phase species; added 7/14/2013, fixed on 8/20/2013
+			if(gasWLR != 0)
+				if(gasWLmethod == 0) // irreversible uptake
+					GasMolecules_matrix[][] -=  GasMolecules_matrix[p][q] * gasWLR * timestep 
+				else // reversible partitioning
+					// wall deposition
+					RxnStep_Matrix_minus[][] = GasMolecules_matrix[p][q] * gasWLR * timestep	// gas-phase wall loss
+					RxnStep_Matrix_minus = RxnStep_Matrix_minus > GasMolecules_matrix ? GasMolecules_matrix : RxnStep_Matrix_minus
+					GasMolecules_matrix[][] -= RxnStep_Matrix_minus
+					WallMolecules_Matrix[][] += RxnStep_Matrix_minus
+					// wall desorption
+					kwg_off = kwg_off*timestep > 1 ? 1/timestep : kwg_off
+					RxnStep_Matrix_plus[][] = WallMolecules_matrix[p][q] * kwg_off * timestep	// desorption from walls
+					GasMolecules_matrix[][] += RxnStep_matrix_Plus[p][q] 
+					WallMolecules_matrix[][] -= RxnStep_Matrix_Plus[p][q]
+					WallMolecules_Time[][][m] = WallMolecules_Matrix[p][q]
+				endif
+			endif
+			
+			// 11ee: Particle loss to the walls; added 08/20/2013; updated 09/29/14
+			if(ParticleWallLoss!=0)
+				WPM3D_Matrix[][][] += ((NpPerBin_time[m-1][r]-NpPerBin_time[m][r])/NpPerBin_time[m-1][r])*PM3D_Matrix[p][q][r]	// wall-bound particles, binned
+				PM3D_Matrix[][][] -= ((NpPerBin_time[m-1][r]-NpPerBin_time[m][r])/NpPerBin_time[m-1][r])*PM3D_Matrix[p][q][r]		// suspended particles, binned
+				MatrixOp/O WallParticleMolec_Matrix = sumBeams(WPM3D_Matrix)	// total wall-bound material
+				MatrixOp/O ParticleMolecules_Matrix = sumBeams(PM3D_Matrix)		// total suspended material
+			endif	
+			// calculate total species concentration after (1) gas-phase reaction, (2) gas-phase wall loss and (3) particle-phase wall loss
+			TotalMolecules_Matrix = GasMolecules_matrix + ParticleMolecules_Matrix // Gas is new; Particle is from previous step, adjusted for wall losses
+
+			setdatafolder $df_home
+		endfor // end loop over VOCs
+		
+		// 11f: Mass Transfer to Particle Phase - Part 1; need to split calculations for multiple VOCs
+		if(KineticMassTransfer==0)
+			// Eqm Partitioning Calculation
+			if(SPM == 0) // as normal
+				wavestats/q ParticleMoleculesSum_Matrix
+				// This function accesses data folders for you
+				EqmCalc_MultipleVOC(SOMparams,Coa_guess=V_sum,SeedConc=SeedMolecules,SeedMW=SeedMW,units="molecules",Tvar=Tvar)
+			else
+				// $$$ sequential partitioning model...need to rewrite for multiple VOCs
+			endif
+		else
+			 // Dynamic partitioning, assuming absorptive partitioning
+			for(idex_VOCs=0;idex_VOCs<nVOCs;idex_VOCs+=1) // start loop over VOCs
+				df_VOC = df_base + ":VOC" + num2istr(idex_VOCs+1) // set to VOC specific data folder
+				setdatafolder $df_VOC
+				// access VOC-specific waves
+				wave RxnStepKinetic3D_Pre2, SatConc_Matrix
+				
+				if(idex_VOCs==0)
+					wave Knudsen_Matrix, MeanFreePath_Matrix, Beta_Matrix, RxnStepKinetic3D_Pre1, Diffusivity_Matrix // access these from the first VOC folder b/c they are the same for all species
+					for(index_size=0;index_size<nSizeBins;index_size+=1)
+		 				Knudsen_Matrix = 2*MeanFreePath_Matrix/(Diameter_time[m-1][index_size]*1e-9)	// Fuchs, assuming Delta=lambda; see S&P p. 602
+						Beta_Matrix = (0.75*alpha*(1+Knudsen_Matrix))/(Knudsen_Matrix^2+Knudsen_Matrix+0.283*Knudsen_Matrix*alpha+0.75*alpha) // Fuchs-Sutugin
+						RxnStepKinetic3D_Pre1[][][index_size] = 4*pi*(Diameter_time[m-1][index_size]*1e-9/2)*Diffusivity_Matrix[p][q]*(timestep/MassTransferTimeScaling)*NpPerBin_time[m][index_size]*Beta_Matrix[p][q]*1e6
+					endfor
+				endif
+				RxnStepKinetic3D_Pre2[][][] = RxnStepKinetic3D_Pre1[p][q][r]*SatConc_Matrix[p][q]*1e-6
+				setdatafolder $df_home
+			endfor // end loop over VOCs
+				
+			// Now, transfer some mass for each VOC	 			
+			for(k=0;k<MassTransferTimeScaling;k+=1)
+				PM3Dsum_matrix = 0 // reset to zero
+				// first loop around VOCs to get total mass for calculation of mole or mass fraction
+				for(idex_VOCs=0;idex_VOCs<nVOCs;idex_VOCs+=1) // start loop over VOCs
+					df_VOC = df_base + ":VOC" + num2istr(idex_VOCs+1) // set to VOC specific data folder
+					setdatafolder $df_VOC
+					wave RxnStepKinetic3D_Cond, GasMolecules_Matrix, SumKinetics, PM3D_Matrix
+	 				// CONDENSATION
+	 				RxnStepKinetic3D_Cond[][][] = RxnStepKinetic3D_Pre1[p][q][r]*GasMolecules_Matrix[p][q] // determine condensation amount; molecules/bin (delta t already accounted for)
+	 				MatrixOp/O SumKinetics = sumBeams(RxnStepKinetic3D_Cond) // sum over particle size bins
+	 				RxnStepKinetic3D_Cond[][][] = SumKinetics[p][q] > GasMolecules_Matrix[p][q] ? 0 : RxnStepKinetic3D_Cond[p][q][r] // conditional to set things to zero if too much mass is transferred
+	 				PM3D_Matrix[][][] += RxnStepKinetic3D_Cond[p][q][r] // add to particle phase across size bins; molecules/bin
+	 				GasMolecules_matrix -= SumKinetics[p][q]
+	 				PM3Dsum_matrix += PM3D_Matrix
+					setdatafolder $df_home
+				endfor // end loop over VOCs
+				// second loop around VOCs to get mole fractions, etc.
+				for(idex_VOCs=0;idex_VOCs<nVOCs;idex_VOCs+=1) // start loop over VOCs
+					df_VOC = df_base + ":VOC" + num2istr(idex_VOCs+1) // set to VOC specific data folder
+					setdatafolder $df_VOC
+					wave MoleFraction3D, PM3D_matrix, MW_matrix, PMM3D_matrix, ParticleMass_matrix
+					wave RxnStepKinetic3D_Evap, RxnStepKinetic3D_Pre2, SumKinetics
+					wave GasMolecules_matrix, ParticleMolecules_matrix
+					if(idex_VOCs==0)
+						PMM3Dsum_matrix[][][] = PM3Dsum_matrix[p][q][r]*MW_matrix[p][q] // weight by molecular weight to use mass fraction
+					endif
+					PMM3D_matrix[][][] = PM3D_Matrix[p][q][r]*MW_matrix[p][q] // weight by molecular weight to use mass fraction
+	 				// loop over size bins
+	 				for(index_size=0;index_size<nSizeBins;index_size+=1) // need to normalize each size bin; so loop through bins
+	 					ParticleMass_Matrix = PMM3D_matrix[p][q][index_size] // get total mass (summed over VOCs) for each bin
+	 					ParticleMassSum_Matrix = PMM3Dsum_matrix[p][q][index_size] // get total mass (summed over VOCs) for each bin
+	 					wavestats/q ParticleMassSum_Matrix // total mass in bin, summed over all SOM species
+	 					if(V_sum==0)
+							MoleFraction3D[][][index_size] = numtype(ParticleMass_Matrix[p][q])==2 ? nan : 1
+						else 
+							if(absorbingseed==0)
+								MoleFraction3D[][][index_size] = ParticleMass_Matrix[p][q]/(V_sum)
+							else
+								MoleFraction3D[][][index_size] = ParticleMass_Matrix[p][q]/(V_sum+MoleculesSeedPerBin[index_size]*seedMW)
+							endif
+						endif
+					endfor // end loop over size bins
+					// evaporation
+	 				RxnStepKinetic3D_Evap[][][] = RxnStepKinetic3D_Pre2[p][q][r]*MoleFraction3D[p][q][r] // evaporation amount; molecules/particle
+	 				RxnStepKinetic3D_Evap[][][] = RxnStepKinetic3D_Evap[p][q][r] > PM3D_Matrix[p][q][r] ? PM3D_Matrix[p][q][r] : RxnStepKinetic3D_Evap[p][q][r] // conditional
+	 				MatrixOp/O SumKinetics = SumBeams(RxnStepKinetic3D_Evap) // for adding to the gas phase
+	 				GasMolecules_matrix[][] += SumKinetics // update gas-phase matrix for each VOC
+	 				PM3D_matrix[][][] -= RxnStepKinetic3D_Evap[p][q][r]
+	 			endfor // end loop over VOCs
+			endfor // end loop over mass transfer time
+			ParticleMoleculesSum_Matrix = 0
+			for(idex_VOCs=0;idex_VOCs<nVOCs;idex_VOCs+=1) // start loop over VOCs
+				df_VOC = df_base + ":VOC" + num2istr(idex_VOCs+1) // set to VOC specific data folder
+				setdatafolder $df_VOC
+				wave ParticleMolecules_matrix, PM3D_matrix		
+	 			MatrixOp/O ParticleMolecules_Matrix = sumBeams(PM3D_Matrix)	// update particle-phase matrix for each VOC
+	 			ParticleMoleculesSum_Matrix += ParticleMolecules_Matrix
+	 		endfor
+		endif
+
+		// 11f: Mass Transfer to Particle Phase - Part 2
+		setdatafolder $df_home
+		ParticleMoleculesSum_Matrix = 0 // reset value to zero
+		for(idex_VOCs=0;idex_VOCs<nVOCs;idex_VOCs+=1) // start loop over VOCs
+			df_VOC = df_base + ":VOC" + num2istr(idex_VOCs+1) // set to VOC specific data folder
+			setdatafolder $df_VOC
+			if(KineticMassTransfer==0)
+				// Eqm Partitioning Calculation --> move molecules around
+				if(SPM == 0) // as normal
+					wave Coa_eqm = Coa // does not include seed particle mass
+					wave TotalMolecules_Matrix, GasMolecules_Matrix, ParticleMolecules_Matrix
+					if(NoSOA==0)	// only operate if you want to include particle-gas partitioning...which is the default case
+						GasMolecules_matrix = TotalMolecules_Matrix - Coa_eqm
+						ParticleMolecules_matrix = Coa_eqm
+					endif
+				else
+					// $$$ sequential partitioning model...need to rewrite for multiple VOCs
+				endif
+			else
+				 // Dynamic partitioning, assuming absorptive partitioning
+			endif
+			ParticleMoleculesSum_matrix += ParticleMolecules_matrix
+			setdatafolder $df_home
+		endfor // end loop over VOCs
+
+// 11ff: Oligomerization reactions
+//		if(OligomerizationIsOn==1)
+//			SOM_Oligomerization(ParticleMolecules_Matrix,krxn_matrix_Olig,timestep,Np,VolumeOrgPerParticle,FirstTime=FirstTime,method=2)
+//			wave ParticleMolecules_Matrix
+//		endif
+
+// 11fff: Final concentrations from this iteration
+		TotalCarbonAtoms = 0
+		TotalOxygenAtoms = 0
+		TotalHydrogenAtoms = 0
+
+		for(idex_VOCs=0;idex_VOCs<nVOCs;idex_VOCs+=1) // start loop over VOCs
+			df_VOC = df_base + ":VOC" + num2istr(idex_VOCs+1) // set to VOC specific data folder
+			setdatafolder $df_VOC
+			wave TotalMolecules_matrix, GasMolecules_matrix, ParticleMolecules_matrix, ParticleMass_matrix, WallParticleMolec_Matrix
+			wave TotalMolecules_time, GasMolecules_time, ParticleMolecules_time
+			wave Coa_time, Coa_time_wallcorr, MW_matrix
+			wave C_matrix, CarbonAtoms, O_matrix, OxygenAtoms, H_matrix, HydrogenAtoms
+			wave O2C_time, H2C_time
+			wave deltaHC_time, Yield_time, HC_ugm3_time
+			
+			TotalMolecules_Matrix = GasMolecules_matrix + ParticleMolecules_Matrix
+			GasMolecules_Time[][][m] = GasMolecules_Matrix[p][q]
+			ParticleMolecules_Time[][][m] = ParticleMolecules_Matrix[p][q]
+			TotalMolecules_Time[][][m] = TotalMolecules_Matrix[p][q]
+			ParticleMoleculesSum_matrix[][] += ParticleMolecules_Matrix[p][q]
+			
+			// Suspended SOA concentration
+			ParticleMass_Matrix = ParticleMolecules_Matrix[p][q] * 1e6 * 1e6 * MW_Matrix[p][q]/Na
+			wavestats/q ParticleMass_matrix
+			Coa_time[m] = V_sum // Current SOA concentration from a given VOC (ug/m^3)
+			CoaSum_time[m] += V_sum
+
+			// Correct for particle deposition
+			ParticleMass_Matrix = (ParticleMolecules_Matrix[p][q] + WallParticleMolec_Matrix[p][q]) * 1e6 * 1e6 * MW_Matrix[p][q]/Na
+			wavestats/q ParticleMass_Matrix
+			Coa_time_wallcorr[m] = V_sum // Current OA concentration, corrected for particle wall-loss (ug/m^3)
+
+			// 11g: O:C calculation		
+			wavestats/Q ParticleMolecules_matrix
+			CarbonAtoms = C_matrix*ParticleMolecules_matrix//V_Sum
+			OxygenAtoms = O_matrix*ParticleMolecules_matrix//V_Sum
+			HydrogenAtoms = H_matrix*ParticleMolecules_matrix//V_sum
+			wavestats/Q CarbonAtoms
+			Ave_nC = V_Sum
+			wavestats/Q OxygenAtoms
+			Ave_nO = V_sum
+			wavestats/Q HydrogenAtoms
+			Ave_nH = V_sum
+			O2C_time[m] = Ave_No/Ave_Nc
+			H2C_time[m] = Ave_Nh/Ave_Nc			
+			TotalCarbonAtoms += CarbonAtoms
+			TotalOxygenAtoms += OxygenAtoms
+			TotalHydrogenAtoms += HydrogenAtoms
+			
+			// Yields and VOC reacted
+			GasMolecules_Parent = GasMolecules_time[p][0][0] * 1e6 * 1e6 * MW_Matrix[p][0]/Na
+			wavestats/q GasMolecules_Parent
+			HCstart = V_sum
+			if(m==1)
+				HC_ugm3_time[0] = V_sum
+				HCsum_ugm3_time[0] += V_sum
+			endif
+			GasMolecules_Parent = GasMolecules_time[p][0][m] * 1e6 * 1e6 * MW_Matrix[p][0]/Na
+			wavestats/q GasMolecules_Parent
+			HCfinish = V_sum
+			HC_ugm3_time[m] = V_sum
+			HCsum_ugm3_time[m] += V_sum
+			deltaHC_time[m] = HCstart - HCfinish // ug/m3
+			Yield_time[m] = Coa_time[m]/deltaHC_time[m]
+			deltaHCsum_time[m] += deltaHC_time[m]
+			setdatafolder $df_home
+		endfor // end loop over VOCs	
+
+		ParticleMoleculesSum_Time[][][m] = ParticleMoleculesSum_Matrix[p][q]
+		wavestats/Q TotalCarbonAtoms
+		Ave_nC = V_Sum
+		wavestats/Q TotalOxygenAtoms
+		Ave_nO = V_sum
+		wavestats/Q TotalHydrogenAtoms
+		Ave_nH = V_sum
+		O2Csum_time[m] = Ave_nO/Ave_nC
+		H2Csum_time[m] = Ave_nH/Ave_nC		
+		
+		// loop over sizes to get new diameters...this may not be quite perfect yet (09/29/14)
+		variable VolOrgTot = 0
+		if(KineticMassTransfer==0) // eqm. partitioning)
+			PM3D_matrix = 0
+			PM3D_matrix[][][0] = ParticleMolecules_Matrix[p][q]
+		endif
+		for(index_size=0;index_size<nSizeBins;index_size+=1)
+			ParticleVolume_matrix = (PM3D_matrix[p][q][index_size]/NpPerBin_time[m][index_size])*(MW_Matrix[p][q]/(Na*Density_Base*1e6))
+			wavestats/Q ParticleVolume_Matrix
+			VolumeOrgPerParticle = V_sum // m^3/p
+			Diameter_time[m][index_size] = 1e9*((6/pi)*(VolumeOrgPerParticle+VolumeSeedPerBin[index_size]))^(1/3)
+			VolumeOrgPerBin[index_size] = VolumeOrgPerParticle
+			VolOrgTot += VolumeOrgPerParticle
+		endfor	
+		MatrixOp/O Np_time = sumRows(NpPerBin_time)	// total number concentration of particles, summed over all bins
+		Dp_time[m] = 1e9*((6/pi)*(VolOrgTot+VolumeSeed))^(1/3)	// for polydisperse simulations, this is an overall "average" diameter
+
+		if(m==100 && quiet == 0)
+			t22 = ticks
+			print "Calculations will likely take ~ " + num2str(((t22-t11)/60)*nsteps/100) + " seconds"
+		endif
+		FirstTime = 0
+
+	endfor // end big kinetics loop
+	
+	// YIELDS
+	YieldSum_time = CoaSum_time/deltaHCsum_time
+	
+	// Print results
+	if(quiet==0)
+		print "[SOA] =  " + num2str(CoaSum_time[nsteps-1]) + " with Yield = " + num2str(YieldSum_time[nsteps-1]) + " and average O:C = " + num2str(O2Csum_time[nsteps-1])
+	endif
+END
+
+// HERE
+	
+
+
+//	wave kOH_special	// testing!!!
+// 11. START KINETICS
+
+//		krxn_matrix = kOH_special[p][q][m-1]
+// 11a: simulates continuous input of parent molecules (i.e. emissions) to keep constant total gas-phase amount.
+//		if(steady_state!=0) 
+//			if(Multiple_compounds==0)
+//				GasMolecules_Matrix[0][0] += RxnStep_matrix_minus[0][0]// (Ctot_init_wave[0]*steady_state)
+//			else
+//				GasMolecules_Matrix[][0] += RxnStep_matrix_minus[p][0]//(Ctot_init_wave*steady_state)
+//			endif
+//		endif
+
+
+// 11bc: this can be used to test "reactive uptake", ala Shiraiwa et al., 2013 PNAS	
+//		if(m >= nsteps-nsteps/2 && counter==0)
+//			gasmolecules_matrix[Nc/2][1] += 5e11
+//			OH_wave[m-1] = 0	
+//			counter = 1
+//		elseif(m > nsteps/3)
+//			OH_wave[m-1] = 0				
+//		endif
+			
+		
+		// DILUTION
+		if(DilutionVar != 0)
+			Totalmolecules_Matrix *= 1-(DilutionVar/100)*(TimeStep/60/60)
+			GasMolecules_Matrix *= 1-(DilutionVar/100)*(TimeStep/60/60)
+			ParticleMolecules_Matrix *= 1-(DilutionVar/100)*(TimeStep/60/60)
+			SeedMolecules *= 1-(DilutionVar/100)*(TimeStep/60/60)
+			MoleculesSeedPerBin *= 1-(DilutionVar/100)*(TimeStep/60/60)
+			SeedConc_time[m] = SeedConc_time[m-1]*(1-(DilutionVar/100)*(TimeStep/60/60))
+		endif
+		
+		// Exposure
+		OH_exposure[m-1] = OH_exposure[m-2]+OH_wave[m-1]*timestep/3600 // molecules cm^-3 hr^-1
+		Lifetimes[m-1] = Lifetimes[m-2] + krxn_matrix[0][0] * OH_wave[m-1] * timestep
+		Lifetimes[m] = Lifetimes[m-2] + 2* krxn_matrix[0][0] * OH_wave[m-1] * timestep
+		TimeW[m] = TimeW[m-1]+timestep/3600
+		if(m==100 && quiet == 0)
+			t22 = ticks
+			print "Calculations will likely take ~ " + num2str(((t22-t11)/60)*nsteps/100) + " seconds"
+		endif
+		FirstTime = 0
+	endfor
+	// END KINETICS	
+	
+	t22 = ticks
+	if(quiet==0)
+		print "Kinetics took "+num2str((t22-t11)/60) + " seconds to execute"
+	endif
+	
+	ParticleMass_Matrix = ParticleMolecules_Matrix[p][q][nsteps] * 1e6 * 1e6 * MW_Matrix[p][q]/Na
+	GasMass_Matrix = GasMolecules_Matrix[p][q][nsteps] * 1e6 * 1e6 * MW_Matrix[p][q]/Na	
+	TotalMass_matrix = particlemass_matrix + gasmass_matrix
+	ParticleMass_Time = ParticleMolecules_Time[p][q][r]*1e12*MW_Matrix[p][q]/Na
+	GasMass_Time = GasMolecules_Time[p][q][r]*1e12*MW_Matrix[p][q]/Na
+	duplicate/o TimeW TimeW_minutes
+	TimeW_minutes = TimeW*60
+	
+	dNdlogDp_time[][] = NpPerBin_time[p][q]/dlogDp
+	dVdlogDp_time[][] = dNdlogDp_time[p][q]*(pi/6)*(diameter_time[p][q]*1e-9)^3/1e18
+	
+// 12: Do some random things for graphing final distribution of products
+	variable type = 1
+	if(type == 0) // molecules
+		wavestats/Q totalmolecules_matrix;
+		GasMolecules_Matrix_Log = log(GasMolecules_Matrix/V_sum)
+		TotalMolecules_Matrix_Log = log(TotalMolecules_Matrix/V_sum)
+		wavestats/Q ParticleMolecules_Matrix
+		Particle_Fraction_Log = log(ParticleMolecules_Matrix/V_sum)
+		Particle_Fraction = ParticleMolecules_Matrix/V_Sum
+		Particle_div_Total = (ParticleMolecules_Matrix/TotalMolecules_Matrix)
+			// Scale the graph showing the composition results
+		DoWindow/F Graph11
+		ModifyImage TotalMolecules_Matrix_Log ctab= {-4,0,Rainbow,0}; 
+		ModifyImage Particle_Fraction_Log ctab= {-4,0,Rainbow,0}; 
+		ModifyImage GasMolecules_Matrix_Log ctab= {-4,0,Rainbow,0}; 
+	else // mass
+		wavestats/Q totalmass_matrix
+		GasMolecules_Matrix_Log = log(GasMass_Matrix/V_sum)
+//		Particle_Fraction_Log = log(ParticleMass_Matrix/V_sum)
+		TotalMolecules_Matrix_Log = log(TotalMass_Matrix/V_sum)
+		wavestats/Q ParticleMass_Matrix
+		Particle_Fraction_Log = log(ParticleMass_Matrix/V_sum)
+		Particle_Fraction = ParticleMass_Matrix/V_Sum
+		Particle_div_Total = (ParticleMass_Matrix/TotalMass_Matrix)
+	endif
+
+	variable Coa_var = Coa_time[0] // Final OA mass concentration
+	
+	deltahc_time = (gasmolecules_time[0][0][0] - GasMolecules_time[0][0][p])* 1e6 * 1e6 * MW_Matrix[0][0]/Na
+	deltaHCfrac_time = deltaHC_time/(gasmolecules_time[0][0][0] * 1e6 * 1e6 * MW_Matrix[0][0]/Na)
+	deltaHCfrac_time = abs(1-deltaHCfrac_time)
+//	deltaHCfrac_time = 1-deltaHCfrac_time
+	HC_ppb_time = 1e9*GasMolecules_time[0][0][p]/(NumberDensityAir*1e-6)//1e3*(Ctot_ppm - deltahc_time/((2.46e25*1e-6/Na)*(MWstart*1e6)))
+
+	Yield_time = Coa_time/deltaHC_time
+	Yield_time = (Coa_time < 1e-7 ? 0 : Yield_time)
+	Yield2_time = (Coa_time - Coa_var)/(deltaHC_Time)
+	Yield2_Time = (Coa_time < 1e-7 ? 0 : Yield2_time)
+	Ncarbons_wave += 0.5
+	Noxygens_wave -= 0.5
+	
+	wavestats/Q Coa_time
+	variable tempvar = V_max
+	wavestats/Q Yield_time
+	variable YieldVar = Yield_time[nsteps]//V_Max
+	
+// Print results
+	if(quiet==0)
+		print "[SOA] =  " + num2str(tempvar)+ "ug/m^3 and Yield = " + num2str(YieldVar) + " for Nc = " + num2str(nC) + " and O:C = " + num2str(O2C_time[nsteps]) + " and ProbOx = " + num2str(ProbOx1) + ";"+ num2str(ProbOx2) + ";"+ num2str(ProbOx3) + ";"+ num2str(ProbOx4) + ";"
+	endif
+//	print "Chi Square values are " + num2str(ChiSq_Coa) + " for Coa and " + num2str(ChiSq_O2C) + " for O2C."
+	
+// Extract into VBS framework (1 for mass, 0 for molecules)
+//	VBS(1) // 1 for mass, 0 for molecules
+//	ParticleMass_Time = ParticleMolecules_Time[p][q][r] /(1e-6 * 1e-6 * Na / MW_Matrix[p][q])
+//	TotalMass_Time = TotalMolecules_Time[p][q][r] /(1e-6 * 1e-6 * Na / MW_Matrix[p][q])
+//	VBS_time(1)
+
+	if(InterpToExperiment==1)
+		setdatafolder root:
+		// interpolate Coa_time, Coa_time_wallcorr and O2C_time to Experiment time (fittime)
+		Interpolate2/T=1/I=3/Y=Coa_time_Interp/X=FitTime TimeW, Coa_time
+		Interpolate2/T=1/I=3/Y=Coa_time_Wallcorr_Interp/X=FitTime TimeW, Coa_time_wallcorr
+		Interpolate2/T=1/I=3/Y=deltaHC_time_Interp/X=FitTime TimeW, deltaHC_time
+
+		wavestats/q O2C_time
+		if(V_npnts > 10)
+			Interpolate2/T=1/I=3/Y=O2C_time_Interp/X=FitTime TimeW, O2C_time
+		else
+			duplicate/o Coa_time_interp O2C_time_interp
+			O2C_time_interp = nan
+		endif
+		wave Coa_time_Interp
+		setscale/P x 0, (timestep/60/60), "hours", Coa_time_interp
+		setscale/P d, 0, 0, "ug/m\S3\M", Coa_time_interp
+		wave Coa_time_WallCorr_Interp
+		setscale/P x 0, (timestep/60/60), "hours", Coa_time_WallCorr_interp
+		setscale/P d, 0, 0, "ug/m\S3\M", Coa_time_interp
+		setscale/P x 0, (timestep/60/60), "hours", O2C_time_interp
+		setscale/P d, 0, 0, "O:C", O2C_time_interp
+		Coa_time_interp = FitTime>TimeW[nSteps-1] ? nan : Coa_time_interp
+		Coa_time_WallCorr_interp = FitTime>TimeW[nSteps-1] ? nan : Coa_time_WallCorr_interp
+		O2C_time_interp = FitTime>TimeW[nSteps-1] ? nan : O2C_time_interp
+		// Calculate ChiSquare Values for Coa and O:C
+		variable/G ChiSq_Coa
+		variable/G ChiSq_O2C
+		wave Coa_experiment
+		if(waveexists(Coa_experiment)==1)
+	//		EstimateError(1,2,30)
+			wave Coa_experiment
+			wave O2C_experiment
+			wave Coa_experiment_err
+			wave O2C_experiment_err
+			wave Coa_experiment_mask
+			wave O2C_experiment_mask
+			duplicate/O Coa_experiment ChiSqTest
+			Coa_experiment_err = max(0.5,0.15*coa_experiment)
+			ChiSqTest = ((Coa_time_interp-Coa_experiment)/Coa_experiment_err)^2 
+			ChiSqTest *= Coa_experiment_mask
+			wavestats/Q ChiSqTest
+			ChiSq_Coa = (1/(numpnts(Coa_time_interp)-6-1))*V_sum
+			O2C_experiment_err = max(0.05,0.3*O2C_experiment)
+			ChiSqTest = ((O2C_time_interp-O2C_experiment)/O2C_experiment_err)^2
+			ChiSqTest *= O2C_experiment_mask
+			wavestats/Q ChiSqTest
+			ChiSq_O2C = V_sum
+		else
+			ChiSq_Coa = nan
+			ChiSq_O2C = nan
+		endif
+	endif
+
+	// Kill unneeded waves	
+	SOM_KillWaves()
+	
+END
