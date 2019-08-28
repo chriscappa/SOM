@@ -4,21 +4,8 @@ strconstant ksDFroot= "root:"
 strconstant ksDFVOCbase = "root:VOCs"
 
 //******************************************************************************************
-// The Statistical Oxidation Model
-// Actually started keeping notes on updates on 07/07/2013
-// 10/16/2013: 1. Saved as v6 (from v5)
-//10/13/2013: Added capability of turning off equilibrium partitioning to particles so that only gas-phase chemistry and gas wall-loss can be considered
-// 08/20/2013: 1. fixed gas-phase wall-loss...it was in the wrong spot and didn't actually do anything. Values around 1e-6/s affect the results. 
-//			  2. Added particle wall loss option, based on wall-losses in Loza et al. Atmos. Chem. Phys., 12, 151–167, 2012
-// 07/20/2013: Added option to perform eqm. calculations based on mass concentrations, as opposed to molecular concentrations
-//			it is not clear which is "better" to use, but some (e.g. Donahue) prefer mass, with the argument that it better captures the actual physicallity of the situation, which is that bigger molecules take up more space.
-//			search for string "units" to update and select which method to use
-// 07/11/2013: MAJOR update
-//			1. it was determined that there was an error in how the fragmentation was being applied. this has now been corrected so that
-//			fragmentation probabilities depend on the oxygen content of the PARENT species. Oops. Corrected both in SOM_v1 and in SOM_Heterogeneous
-//			2. added multithreading to SOM_v1 and heterogeneous that cut off serious time. Hooray.
-// 07/07/2013: added an option to account for wall-losses of gas-phase species
-//			assumes a first order loss, with gasWLR in units of per second.
+// The multi-component Statistical Oxidation Model
+// v7.4.3 (see "SOM Procs.ipf" for notes)
 
 FUNCTION SOM_MC([SOMparams,InitialConcMatrix,fitcoefs,fittime,quiet])
 	wave SOMparams// 2D wave; rows = parameters for a given compound; columns = different compounds
@@ -2969,7 +2956,7 @@ function displayit()
 	endfor
 
 ModifyGraph mode=7,hbFill=2
-•ModifyGraph rgb=(26112,52224,0)
+â€¢ModifyGraph rgb=(26112,52224,0)
 	
 	wave thewave = gasmolecules_time
 	counter=0
