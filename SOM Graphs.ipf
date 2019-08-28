@@ -1,5 +1,9 @@
 #pragma rtGlobals=3		// Use modern global access method and strict wave access.
 
+//*******************************************************************
+// Functions to recreate/create key graphs/panels/tables
+// v7.4.3 (see "SOM procs.ipf" for notes)
+
 //****************************************************************
 // Quick recreate of FitWindow graph
 Function MakeGraph_FitWindow()
