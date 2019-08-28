@@ -7,6 +7,8 @@ Questions should be directed to Chris Cappa (CDC; cdcappa@ucdavis.edu)
   - if you want to contribute updated code, please contact CDC first
   - if you use the SOM in your work, please let CDC know
 
+Please see the SOM manual: https://github.com/chriscappa/SOM/blob/master/SOM%20Manual.md
+
 Consists of five files:
 1. SOM OH reactions - vX.Y.Z.pxp --> the main SOM program. The following four .ipf files should be embedded already, but are contributed for posterity and tracking
 2. SOM procs.ipf --> various procedures associated with running the single-component SOM
