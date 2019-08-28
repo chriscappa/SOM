@@ -284,7 +284,7 @@ End
 // 10/16/2013: 1. Saved as v6 (from v5)
 //10/13/2013: Added capability of turning off equilibrium partitioning to particles so that only gas-phase chemistry and gas wall-loss can be considered
 // 08/20/2013: 1. fixed gas-phase wall-loss...it was in the wrong spot and didn't actually do anything. Values around 1e-6/s affect the results. 
-//			  2. Added particle wall loss option, based on wall-losses in Loza et al. Atmos. Chem. Phys., 12, 151–167, 2012
+//			  2. Added particle wall loss option, based on wall-losses in Loza et al. Atmos. Chem. Phys., 12, 151Â–167, 2012
 // 07/20/2013: Added option to perform eqm. calculations based on mass concentrations, as opposed to molecular concentrations
 //			it is not clear which is "better" to use, but some (e.g. Donahue) prefer mass, with the argument that it better captures the actual physicallity of the situation, which is that bigger molecules take up more space.
 //			search for string "units" to update and select which method to use
@@ -5267,17 +5267,17 @@ function makedualmovie(movienamestr,wvstr1,wvstr2)
 	wave wv2 = $wvstr2
 
 	Display;AppendImage $wvstr1;DelayUpdate
-	•ModifyImage $wvstr1 ctab= {*,*,Rainbow,1};DelayUpdate
-	•ModifyImage $wvstr1 plane= 364
-	•AppendImage/L=L2/B=B2 $wvstr2;DelayUpdate
-	•ModifyImage $wvstr2 ctab= {*,*,Rainbow,1};DelayUpdate
-	•ModifyImage $wvstr2 plane= 364
-	•ModifyGraph lblPos(B2)=37,axisEnab(bottom)={0,0.47},axisEnab(B2)={0.53,1};DelayUpdate
-	•ModifyGraph freePos(L2)={0,B2},freePos(B2)=0;DelayUpdate
-	•Label left "Number of Oxygens\\u#2";DelayUpdate
-	•Label bottom "Number of Carbons\\u#2";DelayUpdate
-	•Label L2 "\\u#2";DelayUpdate
-	•Label B2 "Number of Carbons\\u#2"
+	Â•ModifyImage $wvstr1 ctab= {*,*,Rainbow,1};DelayUpdate
+	Â•ModifyImage $wvstr1 plane= 364
+	Â•AppendImage/L=L2/B=B2 $wvstr2;DelayUpdate
+	Â•ModifyImage $wvstr2 ctab= {*,*,Rainbow,1};DelayUpdate
+	Â•ModifyImage $wvstr2 plane= 364
+	Â•ModifyGraph lblPos(B2)=37,axisEnab(bottom)={0,0.47},axisEnab(B2)={0.53,1};DelayUpdate
+	Â•ModifyGraph freePos(L2)={0,B2},freePos(B2)=0;DelayUpdate
+	Â•Label left "Number of Oxygens\\u#2";DelayUpdate
+	Â•Label bottom "Number of Carbons\\u#2";DelayUpdate
+	Â•Label L2 "\\u#2";DelayUpdate
+	Â•Label B2 "Number of Carbons\\u#2"
 
 	ModifyImage $wvstr1 minRGB=(43520,43520,43520),maxRGB=0
 	ModifyImage $wvstr1 log=1
