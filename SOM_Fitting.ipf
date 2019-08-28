@@ -1,5 +1,9 @@
 #pragma rtGlobals=3		// Use modern global access method and strict wave access.
 
+//************************************************
+// Functions for fitting data using SOM
+// v7.4.3 (see "SOM procs.ipf" for notes)
+
 //**********************************************************************************
 Function allatonce_FitCoa(pw,yw,xw) : FitFunc
 	Wave pw,yw,xw
